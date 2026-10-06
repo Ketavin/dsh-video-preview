@@ -10,24 +10,25 @@
  * plain `200` (no `Accept-Ranges`), and it is capped by the 20MB `mediaLimit`
  * — fine for images/PDFs, wrong for video: without 206 responses the browser
  * disables scrubbing, and files over the cap are rejected outright. This route
- * streams with `createReadStream` and honours `Range`, `If-Range` and suffix
- * ranges (`bytes=-N`).
+ * streams from an opened file handle and honours single byte/suffix ranges.
+ * If-Range conservatively returns the whole representation without a validator.
  *
  * Security posture mirrors better-sidebar's own routes:
  *  - same Host-header trust fence as the `/api` gateway (loopback or the web
  *    runtime's `trustedHosts`; cross-site browser markers refused);
  *  - the resolved path must sit under the session's authoritative working
- *    directory (case/separator tolerant), so a crafted `..` can never escape.
+ *    directory, including canonical link resolution. This does not sandbox a
+ *    hostile local process that can concurrently replace filesystem entries.
  */
-import { createReadStream } from 'node:fs'
-import { stat } from 'node:fs/promises'
-import { extname, resolve, sep } from 'node:path'
+import { open, realpath } from 'node:fs/promises'
+import { basename, extname, isAbsolute, resolve } from 'node:path'
+import { pipeline } from 'node:stream/promises'
 
 /** Plugin identity for cordis.yml rows / client-modules keying. */
 export const name = 'dsh-video-preview'
 
 /** Services required before mounting: route registration + session cwd + the web runtime's trusted hosts. */
-export const inject = ['webServer', 'sessions', 'webRuntime']
+export const inject = ['webServer', 'sessions', 'webRuntime', 'sessionPersistence']
 
 /** Content types for the video route, by extension. */
 const VIDEO_TYPES = {
@@ -107,8 +108,11 @@ function isTrustedApiRequest(request, trustedHosts) {
 // ── path helpers (same semantics as better-sidebar's src/fs-tree.ts) ────────
 
 function requireAbsolute(path) {
-  if (!path.startsWith('/') && !/^[A-Za-z]:[\\/]/.test(path)) {
+  if (!isAbsolute(path) || path.includes('\0')) {
     throw new SidebarError('fs-error', `"${path}" is not an absolute path`, 400)
+  }
+  if (process.platform === 'win32' && path.slice(2).includes(':')) {
+    throw new SidebarError('fs-error', 'alternate file streams are not supported', 400)
   }
   return resolve(path)
 }
@@ -134,29 +138,31 @@ class SidebarError extends Error {
   }
 }
 
-/** Resolve a session's authoritative working directory (fallback chain like
- *  better-sidebar's sessionCwdOf: attached session header → caller cwd → process cwd). */
-function sessionCwdOf(ctx, sessionId, clientCwd) {
+/** Resolve only Host-owned session data; client cwd never grants file access. */
+async function sessionCwdOf(ctx, sessionId) {
   const session = ctx.sessions.get(sessionId)
   const headerCwd = session?.header?.cwd
   if (headerCwd !== undefined && headerCwd !== '') return headerCwd
-  if (clientCwd !== undefined && clientCwd !== '') {
-    try {
-      return resolve(clientCwd)
-    } catch {
-      throw new SidebarError('bad-request', `invalid working directory "${clientCwd}"`)
-    }
+  try {
+    const inspected = await ctx.sessionPersistence.inspect(sessionId)
+    if (inspected.meta.cwd) return requireAbsolute(inspected.meta.cwd)
+  } catch (error) {
+    // Unknown/corrupt sessions cannot be replaced by the browser's cwd.
+    throw new SidebarError('session-unavailable', 'session working directory is unavailable', 404)
   }
-  return process.cwd()
+  throw new SidebarError('session-unavailable', 'session working directory is unavailable', 404)
 }
 
 function writeError(res, error) {
-  const status = error instanceof SidebarError ? error.status : 500
+  const status = error instanceof SidebarError ? error.status : error?.code === 'ENOENT' ? 404 : 500
   if (res.headersSent) {
     res.destroy()
     return
   }
-  const body = Buffer.from(JSON.stringify({ ok: false, error: { code: error?.code ?? 'internal', message: error?.message ?? String(error) } }))
+  const body = Buffer.from(JSON.stringify({ ok: false, error: {
+    code: error instanceof SidebarError ? error.code : 'file-unavailable',
+    message: error instanceof SidebarError ? error.message : 'video file is unavailable',
+  } }))
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': String(body.length) })
   res.end(body)
 }
@@ -166,43 +172,44 @@ function writeError(res, error) {
 /**
  * Parse a single `Range: bytes=...` header against a known size.
  * Returns `{ start, end }` (inclusive), `null` when no range is present, or
- * `{ unsatisfiable: true }` when the range cannot be satisfied. Multi-range
- * requests (`bytes=a-b,c-d`) are served as a single response of the FIRST
- * range, which the HTTP spec explicitly allows.
+ * `{ unsatisfiable: true }` for invalid/unsatisfiable byte ranges. Multi-range
+ * and unknown units are deliberately ignored (full 200), not partly guessed.
  */
 function parseRange(raw, size) {
   if (raw === undefined) return null
   const m = /^bytes=(.+)$/i.exec(raw.trim())
   if (!m) return null
-  const spec = m[1].split(',')[0].trim() // first range only
-  if (spec === '') return null
-  if (spec.startsWith('-')) {
+  if (m[1].includes(',')) return null
+  const spec = /^(\d*)-(\d*)$/.exec(m[1].trim())
+  if (!spec || (spec[1] === '' && spec[2] === '')) return { unsatisfiable: true }
+  if (spec[1] === '') {
     // suffix range: last N bytes
-    const suffix = Number(spec.slice(1))
-    if (!Number.isFinite(suffix) || suffix <= 0) return null
+    const suffix = Number(spec[2])
+    if (!Number.isSafeInteger(suffix) || suffix <= 0) return { unsatisfiable: true }
     if (suffix >= size) return { start: 0, end: size - 1 }
     return { start: size - suffix, end: size - 1 }
   }
-  const dash = spec.indexOf('-')
-  if (dash === -1) return null
-  const startText = spec.slice(0, dash)
-  const endText = spec.slice(dash + 1)
-  const start = startText === '' ? 0 : Number(startText)
-  const end = endText === '' ? size - 1 : Number(endText)
-  if (!Number.isInteger(start) || start < 0 || !Number.isInteger(end)) return null
+  const start = Number(spec[1])
+  const end = spec[2] === '' ? size - 1 : Number(spec[2])
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || end < start) return { unsatisfiable: true }
   if (start >= size) return { unsatisfiable: true }
   return { start, end: Math.min(end, size - 1) }
 }
 
 /** Render one response for a range or full request. */
-function serveFile(req, res, path, size, type) {
+async function serveFile(req, res, file, path, size, type, download) {
   const headers = {
     'content-type': type,
     'accept-ranges': 'bytes',
-    'cache-control': 'no-cache',
+    'cache-control': 'private, no-store',
+    'x-content-type-options': 'nosniff',
+    ...(download ? { 'content-disposition': `attachment; filename="video${extname(path)}"; filename*=UTF-8''${encodeURIComponent(basename(path)).replace(/['()*]/g, c => '%' + c.charCodeAt(0).toString(16))}` } : {}),
   }
 
-  const range = parseRange(header(req.headers, 'range'), size)
+  // HEAD has no range semantics. Without a proven strong file validator,
+  // If-Range conservatively selects the full representation (RFC 9110 §13.1.5).
+  const range = req.method === 'GET' && header(req.headers, 'if-range') === undefined
+    ? parseRange(header(req.headers, 'range'), size) : null
   if (range?.unsatisfiable) {
     res.writeHead(416, { ...headers, 'content-range': `bytes */${size}` })
     res.end()
@@ -220,9 +227,7 @@ function serveFile(req, res, path, size, type) {
       res.end()
       return
     }
-    const stream = createReadStream(path, { start, end })
-    stream.on('error', () => res.destroy())
-    stream.pipe(res)
+    await pipeline(file.createReadStream({ start, end }), res)
     return
   }
 
@@ -231,9 +236,7 @@ function serveFile(req, res, path, size, type) {
     res.end()
     return
   }
-  const stream = createReadStream(path)
-  stream.on('error', () => res.destroy())
-  stream.pipe(res)
+  await pipeline(file.createReadStream(), res)
 }
 
 // ── plugin body ──────────────────────────────────────────────────────────────
@@ -251,7 +254,7 @@ export function apply(ctx) {
         return
       }
       if (req.method !== 'GET' && req.method !== 'HEAD') {
-        res.writeHead(405)
+        res.writeHead(405, { allow: 'GET, HEAD' })
         res.end()
         return
       }
@@ -259,24 +262,29 @@ export function apply(ctx) {
         const url = new URL(req.url ?? '/', 'http://dsh.internal')
         const sessionId = url.searchParams.get('sessionId')
         const raw = url.searchParams.get('path')
-        if (sessionId === null || raw === null) {
+        if (!sessionId || sessionId.length > 256 || sessionId.includes('\0') || !raw) {
           throw new SidebarError('bad-request', 'sessionId and path are required')
         }
-        const cwd = sessionCwdOf(ctx, sessionId, url.searchParams.get('cwd') ?? undefined)
+        const cwd = requireAbsolute(await sessionCwdOf(ctx, sessionId))
         const path = requireAbsolute(raw)
         if (!isWithin(cwd, path)) {
           throw new SidebarError('fs-error', 'video path outside the session working directory', 403)
         }
-        const info = await stat(path)
-        if (!info.isFile()) {
-          throw new SidebarError('fs-error', 'not a file', 400)
+        const type = VIDEO_TYPES[extname(path).toLowerCase()]
+        if (!type) throw new SidebarError('unsupported-type', 'not a supported video filename', 415)
+        const [root, canonical] = await Promise.all([realpath(cwd), realpath(path)])
+        if (!isWithin(root, canonical)) throw new SidebarError('fs-error', 'video path outside the session working directory', 403)
+        const file = await open(canonical, 'r')
+        try {
+          // Stream this opened handle, not a second pathname lookup. Recheck
+          // canonical containment after opening to catch ordinary link changes.
+          if (!isWithin(root, await realpath(canonical))) throw new SidebarError('fs-error', 'video path changed', 403)
+          const info = await file.stat()
+          if (!info.isFile() || info.size === 0) throw new SidebarError('fs-error', 'empty or non-file video', 400)
+          await serveFile(req, res, file, path, info.size, type, url.searchParams.get('download') === '1')
+        } finally {
+          await file.close()
         }
-        if (info.size === 0) {
-          // Nothing to stream; a zero-length "video" is an error state.
-          throw new SidebarError('fs-error', 'empty video file', 400)
-        }
-        const type = VIDEO_TYPES[extname(path).toLowerCase()] ?? 'application/octet-stream'
-        serveFile(req, res, path, info.size, type)
       } catch (error) {
         writeError(res, error)
       }

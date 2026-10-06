@@ -8,7 +8,7 @@
  * registered with window.__ModuleLoader__.load({ id, factory }). `react` is
  * an external resolved from the shell's module table at runtime; everything
  * else is inlined. The viewer streams from the plugin's own /video host route
- * (HTTP Range → seeking works), falling back to the built-in download route.
+ * (HTTP Range → seeking works); downloads use the same uncapped stream route.
  */
 window.__ModuleLoader__.load({
   id: "dsh-video-preview",
@@ -29,18 +29,16 @@ window.__ModuleLoader__.load({
     /** Absolute URL of the plugin's range-capable video route. */
     function videoUrl(scope, path) {
       var params = new URLSearchParams({ sessionId: scope.sessionId, path: path });
-      if (scope.cwd !== undefined && scope.cwd !== "") params.set("cwd", scope.cwd);
       return "/video?" + params.toString();
     }
 
-    /** Absolute URL of the built-in download route (fallback for formats the
+    /** Absolute URL of the plugin's streamed download route (fallback for formats the
      *  browser cannot decode — the <video> onError path still lets the user
      *  grab the raw file). */
     function downloadUrl(scope, path) {
       var params = new URLSearchParams({ sessionId: scope.sessionId, path: path });
-      if (scope.cwd !== undefined && scope.cwd !== "") params.set("cwd", scope.cwd);
       params.set("download", "1");
-      return "/sidebar/file?" + params.toString();
+      return "/video?" + params.toString();
     }
 
     /**
@@ -80,6 +78,20 @@ window.__ModuleLoader__.load({
       var path = props.path;
       var url = videoUrl(scope, path);
       var dl = downloadUrl(scope, path);
+      var media = import_react.useRef(null);
+      var state = import_react.useState(false);
+      var failed = state[0];
+      var setFailed = state[1];
+      import_react.useEffect(function () {
+        setFailed(false);
+        var element = media.current;
+        return function () {
+          if (!element) return;
+          element.pause();
+          element.removeAttribute("src");
+          element.load();
+        };
+      }, [url]);
       return import_react.createElement("div", {
         style: {
           display: "flex",
@@ -93,11 +105,14 @@ window.__ModuleLoader__.load({
         }
       }, [
         import_react.createElement("video", {
-          key: "v",
+          key: url,
+          ref: media,
           src: url,
           controls: true,
           preload: "metadata",
           playsInline: true,
+          onError: function () { setFailed(true); },
+          onLoadedMetadata: function () { setFailed(false); },
           style: {
             width: "100%",
             maxHeight: "100%",
@@ -108,6 +123,7 @@ window.__ModuleLoader__.load({
             outline: "none"
           }
         }),
+        failed && import_react.createElement("div", { key: "error", role: "status", style: { fontSize: "12px" } }, "无法播放此视频，请检查连接或下载后查看。"),
         import_react.createElement("div", {
           key: "meta",
           style: {
